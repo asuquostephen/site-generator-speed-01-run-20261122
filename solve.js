@@ -16,47 +16,52 @@ const hasOwn = (o, k) => Object.hasOwn(o, k);
 // ---------------------------------------------------------------- text
 
 const ESC_RE = /[&<>"']/;
+const ESC_RE_G = /[&<>"']/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 export function escapeHtml(s) {
   if (!ESC_RE.test(s)) return s;
-  let out = '';
-  let last = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    let e;
-    if (c === '&') e = '&amp;';
-    else if (c === '<') e = '&lt;';
-    else if (c === '>') e = '&gt;';
-    else if (c === '"') e = '&quot;';
-    else if (c === "'") e = '&#39;';
-    else continue;
-    out += s.slice(last, i) + e;
-    last = i + 1;
-  }
-  return out + s.slice(last);
+  // Single regex replace: V8 scans in C++ and only calls back per escape found.
+  return s.replace(ESC_RE_G, (c) => ESC_MAP[c]);
 }
 
 const MARK_RE = /\p{M}/gu;
 function slugifyRaw(text) {
   // Pure-ASCII text is already NFKD with no combining marks: skip normalize/replace.
-  let plain = text;
   let ascii = true;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) >= 128) { ascii = false; break; }
   }
-  if (!ascii) plain = text.normalize('NFKD').replace(MARK_RE, '');
   let out = '';
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
-      continue;
+  if (ascii) {
+    // Char-code loop: same keep/gap rules as the general path below.
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      let keep = -1;
+      if (c >= 65 && c <= 90) keep = c + 32;
+      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+      if (keep === -1) {
+        gap = out.length > 0;
+        continue;
+      }
+      if (gap) out += '-';
+      gap = false;
+      out += String.fromCharCode(keep);
     }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
+  } else {
+    const plain = text.normalize('NFKD').replace(MARK_RE, '');
+    for (const ch of plain) {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) {
+        gap = out.length > 0;
+        continue;
+      }
+      if (gap) out += '-';
+      gap = false;
+      out += keep;
+    }
   }
   out = out.slice(0, 64).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
@@ -82,10 +87,16 @@ function isWSCode(c) {
     (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
 }
 
-/** Word count: runs of non-whitespace (V8's regex match runs in C++). */
+/** Word count: runs of non-whitespace, counted by scanning char codes.
+ *  isWSCode mirrors the \s class exactly, so this counts what /\S+/g matches. */
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    if (isWSCode(text.charCodeAt(i))) inWord = false;
+    else if (!inWord) { inWord = true; count++; }
+  }
+  return count;
 }
 
 function resolvePath(dir, rel) {
@@ -277,8 +288,37 @@ function isHr(line) {
   return true;
 }
 
-function endsParagraph(line) {
-  return isBlankLine(line) || fenceLang(line) !== null || headingOf(line) !== null || isHr(line);
+/** Boolean-only paragraph-end check: same verdict as
+ *  isBlankLine || fenceLang !== null || headingOf !== null || isHr, but allocates
+ *  nothing (headingOf/fenceLang build an object / a slice). Only called for lines
+ *  opening on '`', '#', '-', '*', ' ' or '\t' — the only chars those can start with. */
+function endsParagraphFast(line) {
+  const c0 = line.charCodeAt(0);
+  if (c0 === 96) { // '`': fence open — ``` + lang chars + spaces/tabs only
+    if (line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+    let k = 3;
+    while (k < line.length && isLangChar(line[k])) k++;
+    for (; k < line.length; k++) {
+      if (line[k] !== ' ' && line[k] !== '\t') return false;
+    }
+    return true;
+  }
+  if (c0 === 35) { // '#': heading — 1-6 '#', a space/tab, then a non-space/tab char
+    let h = 0;
+    while (h < line.length && line.charCodeAt(h) === 35) h++;
+    if (h > 6 || h >= line.length) return false;
+    if (line[h] !== ' ' && line[h] !== '\t') return false;
+    for (let k = h + 1; k < line.length; k++) {
+      if (line[k] !== ' ' && line[k] !== '\t') return true;
+    }
+    return false;
+  }
+  if (c0 === 45 || c0 === 42) return isHr(line); // '-' or '*'
+  // ' ' or '\t': only a blank line ends the paragraph
+  for (let k = 0; k < line.length; k++) {
+    if (line[k] !== ' ' && line[k] !== '\t') return false;
+  }
+  return true;
 }
 
 function findUnescaped(s, what, from) {
@@ -309,25 +349,23 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** Inline rendering: jump between markdown marks with indexOf (C++ scans) instead of
- *  stepping every character; plain runs are flushed through escapeHtml in bulk. */
+const MARK_SCAN_RE = /[\\`*[]/g;
+
+/** Inline rendering: jump between markdown marks with one combined regex scan
+ *  (C++ pass) instead of four indexOf scans per step; plain runs are flushed
+ *  through escapeHtml in bulk. The shared regex is safe under recursion: every
+ *  exec is immediately preceded by setting lastIndex and its result is consumed
+ *  before any nested call. */
 function inline(s, env) {
   const out = [];
   let i = 0;
   let run = 0;
   const flush = (to) => { if (to > run) out.push(escapeHtml(s.slice(run, to))); };
   while (i < s.length) {
-    let j = s.length;
-    let k = s.indexOf('\\', i);
-    if (k !== -1 && k < j) j = k;
-    k = s.indexOf('`', i);
-    if (k !== -1 && k < j) j = k;
-    k = s.indexOf('*', i);
-    if (k !== -1 && k < j) j = k;
-    k = s.indexOf('[', i);
-    if (k !== -1 && k < j) j = k;
-    if (j >= s.length) break;
-    i = j;
+    MARK_SCAN_RE.lastIndex = i;
+    const m = MARK_SCAN_RE.exec(s);
+    if (m === null) break;
+    i = m.index;
     const c = s[i];
     if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
       flush(i);
@@ -405,9 +443,9 @@ function renderMarkdown(src, env, slug) {
       while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      let code = '';
-      for (let k = 0; k < body.length; k++) code += escapeHtml(body[k]) + '\n';
-      blocks.push(`<pre><code${cls}>${code}</code></pre>`);
+      const codeParts = [];
+      for (let k = 0; k < body.length; k++) codeParts.push(escapeHtml(body[k]), '\n');
+      blocks.push(`<pre><code${cls}>${codeParts.join('')}</code></pre>`);
       continue;
     }
     const heading = headingOf(line);
@@ -489,7 +527,7 @@ function renderMarkdown(src, env, slug) {
       if (l === '') break;
       const c0 = l.charCodeAt(0);
       if (c0 === 96 || c0 === 35 || c0 === 45 || c0 === 42 || c0 === 32 || c0 === 9) {
-        if (endsParagraph(l)) break;
+        if (endsParagraphFast(l)) break;
       }
       body.push(trimST(l));
       i++;
