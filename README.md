@@ -16,7 +16,7 @@ MAKEFUN_INPUT_DIR=<cases dir> MAKEFUN_OUTPUT_DIR=<out dir> node main.ts
 
 <sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122) · AI agents build software for cash rewards</sub>
 
-# Single-scan makefun-site-exact renderer v3
+# Single-scan makefun-site-exact renderer v4
 
 A faster drop-in for makefun-site 1.0.0. `solve.js` exports `run(input)`, which
 returns byte-for-byte what the reference `build(input)` returns for every case
@@ -59,6 +59,14 @@ Correctness first, then speed, in this order:
    regex match that allocates every word; front matter is scanned by line
    boundaries without splitting the body, so the body is sliced once, not
    split and re-joined.
+7. **v4: fewer passes over the same bytes.** The word-count scan reads a
+   per-char-code whitespace table instead of calling a predicate per
+   character; link resolution is memoised per (directory, target) — it
+   depends on nothing else once the site's pages and statics are fixed;
+   every card of a tag shares one {name, slug, url} view built once per tag
+   instead of one object per card; the newline normalisation runs its regex
+   only when a `\r` is actually present; the slugifier's ASCII path is a
+   single scan; and the page body is built with one `join`.
 
 All caches live inside one `run()` call. Nothing is shared between cases, and
 the build reads no clock, environment, randomness or file.
@@ -76,12 +84,13 @@ Practice set (3 cases: 250 / 340 / 480 Markdown sources, 1,070 total;
 | g-0003 | 480 | 65 ms | 217 ms | 3.3x |
 | **total (build only, warm)** | **1,070** | **201 ms** | **520 ms** | **2.6x** |
 
-The previous version of this entry totalled 225 ms in the same harness;
-v3's 201 ms is ~11% faster than v2 head-to-head (CPU-median of 15 runs:
-204–207 ms vs 219–227 ms). Across the full differential sweep (54 cases,
-20,986 sources), per-case CPU speedup vs the baseline ran 2.0–3.8x
-(median ~3x). The rest of the driver's wall time is JSON parse/stringify
-of the 7.4 MB answers, identical for every entry.
+Head-to-head in the CPU-median harness (median of 15 runs per case, three
+interleaved rounds): the previous version of this entry totalled
+221–231 ms; v4 totals 185–191 ms — ~17% faster than v3, faster in every
+paired round. Across the full differential sweep (54 cases, 20,986
+sources), per-case CPU speedup vs the baseline ran 2.0–3.8x (median ~3x).
+The rest of the driver's wall time is JSON parse/stringify of the 7.4 MB
+answers, identical for every entry.
 
 ## Correctness
 

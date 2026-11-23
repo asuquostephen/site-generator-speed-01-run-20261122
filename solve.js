@@ -5,6 +5,10 @@
 // regex storm), cached slug/date work, precompiled templates rendered into chunk
 // arrays, and include memoisation keyed on the exact values the included template
 // can observe. All caches live inside one run() call: nothing is shared between cases.
+// v4 adds: a per-char-code whitespace table for the word-count scan, link
+// resolution memoised per (directory, target), one shared {name, slug, url}
+// view per tag instead of one per card, a \r pre-check before the newline
+// normalisation, a single-scan slugifier, and a join-built page body.
 
 const REPORT_FILE = 'build-report.txt';
 const RESERVED = ['posts', 'tags', 'page'];
@@ -27,28 +31,29 @@ export function escapeHtml(s) {
 const MARK_RE = /\p{M}/gu;
 function slugifyRaw(text) {
   // Pure-ASCII text is already NFKD with no combining marks: skip normalize/replace.
-  let ascii = true;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) >= 128) { ascii = false; break; }
-  }
+  // One scan: the ASCII loop below is the general path's keep/gap rules applied to
+  // char codes; meeting a non-ASCII char discards the partial work and takes the
+  // general path over the whole string, so the result is identical either way.
   let out = '';
   let gap = false;
-  if (ascii) {
-    // Char-code loop: same keep/gap rules as the general path below.
-    for (let i = 0; i < text.length; i++) {
-      const c = text.charCodeAt(i);
-      let keep = -1;
-      if (c >= 65 && c <= 90) keep = c + 32;
-      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-      if (keep === -1) {
-        gap = out.length > 0;
-        continue;
-      }
-      if (gap) out += '-';
-      gap = false;
-      out += String.fromCharCode(keep);
+  let i = 0;
+  for (; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 128) break;
+    let keep = -1;
+    if (c >= 65 && c <= 90) keep = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+    if (keep === -1) {
+      gap = out.length > 0;
+      continue;
     }
-  } else {
+    if (gap) out += '-';
+    gap = false;
+    out += String.fromCharCode(keep);
+  }
+  if (i < text.length) {
+    out = '';
+    gap = false;
     const plain = text.normalize('NFKD').replace(MARK_RE, '');
     for (const ch of plain) {
       let keep = null;
@@ -87,13 +92,18 @@ function isWSCode(c) {
     (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
 }
 
+// Per-char-code whitespace table: a typed-array read replaces a function call
+// per character in the hot scans below. Built from isWSCode, so identical.
+const WS_TABLE = new Uint8Array(65536);
+for (let c = 0; c < 65536; c++) if (isWSCode(c)) WS_TABLE[c] = 1;
+
 /** Word count: runs of non-whitespace, counted by scanning char codes.
- *  isWSCode mirrors the \s class exactly, so this counts what /\S+/g matches. */
+ *  WS_TABLE mirrors the \s class exactly, so this counts what /\S+/g matches. */
 function wordsOf(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWSCode(text.charCodeAt(i))) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)]) inWord = false;
     else if (!inWord) { inWord = true; count++; }
   }
   return count;
@@ -505,7 +515,7 @@ function renderMarkdown(src, env, slug) {
           // continuation: two or more spaces then a non-whitespace character
           let sp = 0;
           while (sp < l.length && l.charCodeAt(sp) === 32) sp++;
-          if (sp >= 2 && sp < l.length && !isWSCode(l.charCodeAt(sp))) {
+          if (sp >= 2 && sp < l.length && !WS_TABLE[l.charCodeAt(sp)]) {
             items[items.length - 1].push(trimST(l));
             i++;
           } else break;
@@ -536,8 +546,7 @@ function renderMarkdown(src, env, slug) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  let html = '';
-  for (let k = 0; k < blocks.length; k++) html += blocks[k] + '\n';
+  const html = blocks.length === 0 ? '' : blocks.join('\n') + '\n';
   return { html, toc, excerpt: excerpt ?? '' };
 }
 
@@ -708,37 +717,45 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         }
         break;
       }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t === undefined || depth >= INCLUDE_DEPTH) break;
-        // Memoise only templates observing at most one value: the repeat renders that
-        // pay are card/tag-list (one post card, rendered on index and tag pages);
-        // multi-segment templates (head/footer/...) render once per page anyway, so
-        // key-building for them would cost more than re-rendering.
-        const segs = ctx.memoSegs.get(n.name);
-        if (segs !== undefined && segs.length <= 1) {
-          let key = n.name + '|' + depth;
-          for (let s = 0; s < segs.length; s++) {
-            const v = lookup(scope, [segs[s]]);
-            if (v === undefined) key += '|u';
-            else if (v === null) key += '|n';
-            else if (typeof v === 'object') key += '|o' + ctx.objId(v);
-            else key += '|v' + String(v);
-          }
-          const hit = ctx.memo.get(key);
-          if (hit !== undefined) { out.push(hit); break; }
-          const sub = [];
-          renderNodes(t, scope, ctx, depth + 1, sub);
-          const rendered = sub.join('');
-          ctx.memo.set(key, rendered);
-          out.push(rendered);
-        } else {
-          renderNodes(t, scope, ctx, depth + 1, out);
-        }
+      case 'include':
+        renderInclude(ctx, n.name, scope, depth, out);
         break;
-      }
     }
   }
+}
+
+/** Include rendering, used by the template interpreter.
+ *  Memoise only templates observing at most one value: the repeat renders that
+ *  pay are card/tag-list (one post card, rendered on index and tag pages);
+ *  multi-segment templates (head/footer/...) render once per page anyway, so
+ *  key-building for them would cost more than re-rendering. */
+function renderInclude(ctx, name, scope, depth, out) {
+  const t = ctx.templates.get(name);
+  if (t === undefined || depth >= INCLUDE_DEPTH) return;
+  const segs = ctx.memoSegs.get(name);
+  if (segs !== undefined && segs.length <= 1) {
+    let key = name + '|' + depth;
+    for (let s = 0; s < segs.length; s++) {
+      const v = lookup(scope, [segs[s]]);
+      if (v === undefined) key += '|u';
+      else if (v === null) key += '|n';
+      else if (typeof v === 'object') key += '|o' + ctx.objId(v);
+      else key += '|v' + String(v);
+    }
+    const hit = ctx.memo.get(key);
+    if (hit !== undefined) { out.push(hit); return; }
+    const sub = [];
+    renderTemplate(ctx, name, scope, depth + 1, sub);
+    const rendered = sub.join('');
+    ctx.memo.set(key, rendered);
+    out.push(rendered);
+  } else {
+    renderTemplate(ctx, name, scope, depth + 1, out);
+  }
+}
+
+function renderTemplate(ctx, name, scope, depth, out) {
+  renderNodes(ctx.templates.get(name), scope, ctx, depth, out);
 }
 
 // ---------------------------------------------------------------- the build
@@ -791,8 +808,12 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
-    else statics.push({ path: f.path, content: f.content });
+    if (f.path.endsWith('.md')) {
+      // The \r scan only runs when a \r is actually present (a plain includes
+      // search is cheaper than the regex pass over every source).
+      const c = f.content;
+      sources.push({ path: f.path, text: c.includes('\r') ? c.replace(/\r\n?/g, '\n') : c });
+    } else statics.push({ path: f.path, content: f.content });
   }
 
   // 2. Front matter, in order: refused, generator's own dir, post without date,
@@ -852,19 +873,46 @@ export function run(input) {
   const staticPaths = new Set();
   for (const f of statics) staticPaths.add(f.path);
   const broken = new Set();
+  // Link resolution depends only on (dir, target) once bySource/staticPaths/base
+  // are fixed, so it is memoised per run; a broken result is memoised as a
+  // sentinel and still records its per-source report line on every hit.
+  const BROKEN_LINK = {};
+  const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    let byTarget = linkCache.get(dir);
+    if (byTarget === undefined) {
+      byTarget = new Map();
+      linkCache.set(dir, byTarget);
+    }
     const env = {
       link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
-        broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
+        const hit = byTarget.get(target);
+        if (hit !== undefined) {
+          if (hit === BROKEN_LINK) {
+            broken.add(`broken-link ${s.path} -> ${target}`);
+            return target;
+          }
+          return hit;
+        }
+        let out;
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) {
+          out = target;
+        } else {
+          const hash = target.indexOf('#');
+          const rel = hash === -1 ? target : target.slice(0, hash);
+          const frag = hash === -1 ? '' : target.slice(hash);
+          const path = rel === '' ? null : resolvePath(dir, rel);
+          if (path !== null && bySource.has(path)) out = `${bySource.get(path).url}${frag}`;
+          else if (path !== null && staticPaths.has(path)) out = `${base}/${path}${frag}`;
+          else {
+            broken.add(`broken-link ${s.path} -> ${target}`);
+            byTarget.set(target, BROKEN_LINK);
+            return target;
+          }
+        }
+        byTarget.set(target, out);
+        return out;
       },
     };
     const md = renderMarkdown(s.body, env, slug);
@@ -899,7 +947,10 @@ export function run(input) {
       const sl = slug(name);
       let tag = bySlug.get(sl);
       if (tag === undefined) {
-        tag = { name, slug: sl, url: `${base}/tags/${sl}/`, posts: [] };
+        const url = `${base}/tags/${sl}/`;
+        // cardTag is the {name, slug, url} view cards expose of this tag, built
+        // once here instead of per card (templates only read those fields).
+        tag = { name, slug: sl, url, posts: [], cardTag: { name, slug: sl, url } };
         bySlug.set(sl, tag);
       }
       tag.posts.push(p);
@@ -926,7 +977,7 @@ export function run(input) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    tags: s.tagRefs.map((t) => t.cardTag ?? { name: t.name, slug: t.slug, url: t.url }),
   });
   const cards = new Map();
   for (const p of posts) cards.set(p, cardOf(p));
@@ -934,10 +985,9 @@ export function run(input) {
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
+    if (templates.get(name) === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    renderTemplate(ctx, name, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, 0, out);
     return out.join('');
   };
   const output = {};
@@ -948,7 +998,7 @@ export function run(input) {
         title: c.title, url: c.url, date: c.date, date_long: c.date_long, summary: c.summary,
         excerpt: c.excerpt, reading_minutes: c.reading_minutes, tags: c.tags,
         slug: s.slug, content: s.html,
-        toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+        toc: s.toc,
         newer: linkOf(s.newer ?? null), older: linkOf(s.older ?? null), is_post: s.post,
       },
     });
